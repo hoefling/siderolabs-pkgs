@@ -1,0 +1,24 @@
+From 5b98baac181bc2060e5d06801b59008a64b29903 Mon Sep 17 00:00:00 2001
+From: Oleg Hoefling <oleg.hoefling@ionos.com>
+Date: Sun, 16 Aug 2026 17:23:43 +0200
+Subject: [PATCH] units: add HZ_PER_GHZ
+
+---
+ include/linux/units.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/linux/units.h b/include/linux/units.h
+index 00e15de33..06870e9e9 100644
+--- a/include/linux/units.h
++++ b/include/linux/units.h
+@@ -27,6 +27,7 @@
+ 
+ #define HZ_PER_KHZ		1000UL
+ #define HZ_PER_MHZ		1000000UL
++#define HZ_PER_GHZ		1000000000UL
+ 
+ #define KHZ_PER_MHZ		1000UL
+ #define KHZ_PER_GHZ		1000000UL
+-- 
+2.50.1 (Apple Git-155)
+
