@@ -71,6 +71,12 @@ jobs:
             USERNAME=${{ steps.owner.outputs.name }} \
             TAG=${{ github.sha }}-${{ matrix.arch }}
 
+      - name: Assert PWM driver is enabled
+        if: matrix.arch == 'arm64'
+        run: |
+          grep -q '^CONFIG_PWM_RASPBERRYPI_RP1=y' kernel/build/config-arm64
+          grep -q 'PWM_RASPBERRYPI_RP1' kernel/build/patches/*pwm-rp1*.patch
+
   merge:
     needs: build
     runs-on: ubuntu-latest
