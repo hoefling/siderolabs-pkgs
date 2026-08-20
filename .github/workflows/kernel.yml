@@ -1,19 +1,30 @@
 name: kernel
 
 # Builds the patched Talos kernel natively on both architectures and merges
-# the results into one multi-arch manifest that `make imager PKG_KERNEL=...`
-# can consume.
+# the results into one multi-arch manifest.
+#
+# Versioning: push a git tag `v<talos-version>-<n>` (e.g. v1.13.9-1) and the
+# image is published as ghcr.io/<owner>/kernel:<that tag>. Upstream pkgs tags
+# too sparsely to derive a version from, so the Talos version this branch is
+# rebased for is used instead.
+#
+# Release ritual:
+#   git rebase --onto <pkgs-commit-talos-pins> <old-base> rp1-pwm-1.13
+#   git push --force-with-lease
+#   git tag v1.13.9-1 && git push origin v1.13.9-1
+#
+# The kernel package must be PUBLIC in ghcr — the imager pulls it anonymously.
 
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
-      extra_tag:
-        description: "Additional tag for the merged manifest (e.g. v1.13.8-rp1pwm)"
-        required: false
-        default: ""
-  push:
-    branches:
-      - rp1-pwm-1.13
+      version:
+        description: "Version to publish (e.g. v1.13.9-1). Required for manual runs."
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -21,14 +32,81 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
+  # The upstream branch this fork tracks; used to locate the pkgs base commit.
+  UPSTREAM_BRANCH: release-1.13
+  # Must match the symbol declared by the RP1 PWM patch's Kconfig hunk.
+  # Guards against the silent-drop failure: syncconfig discards unknown
+  # symbols, so a renamed symbol yields a clean build with no driver.
+  REQUIRED_SYMBOL: CONFIG_PWM_RASPBERRYPI_RP1
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      owner: ${{ steps.v.outputs.owner }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          V="${{ inputs.version }}"
+          [ -n "$V" ] || V="${GITHUB_REF_NAME}"
+          case "$V" in
+            v*) ;;
+            *) echo "::error::version must start with v: ${V}"; exit 1 ;;
+          esac
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          echo "Publishing kernel \`${V}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  preflight:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # These two checks cost seconds and catch the mistake that silently
+      # produces a stock kernel: a config symbol that does not match the
+      # symbol the patch actually declares.
+      - name: Assert patch and config agree
+        run: |
+          set -euo pipefail
+          PATCH=$(ls kernel/build/patches/*pwm-rp1*.patch 2>/dev/null | head -1)
+          [ -n "$PATCH" ] || { echo "::error::no pwm-rp1 patch found"; exit 1; }
+
+          grep -q "^${REQUIRED_SYMBOL}=y" kernel/build/config-arm64 \
+            || { echo "::error::${REQUIRED_SYMBOL}=y missing from config-arm64"; exit 1; }
+
+          grep -q "${REQUIRED_SYMBOL}" "$PATCH" \
+            || { echo "::error::${REQUIRED_SYMBOL} not declared by ${PATCH}"; exit 1; }
+
+          echo "patch: ${PATCH}"
+          echo "symbol: ${REQUIRED_SYMBOL} OK"
+
+      - name: Report build inputs
+        run: |
+          set -euo pipefail
+          git fetch origin "${UPSTREAM_BRANCH}" --tags --quiet || true
+          BASE=$(git describe --tags --abbrev=12 \
+                   "$(git merge-base HEAD "origin/${UPSTREAM_BRANCH}")" 2>/dev/null || echo unknown)
+          LINUX=$(grep '^  linux_version:' Pkgfile | awk '{print $2}')
+          {
+            echo "| key | value |"
+            echo "|---|---|"
+            echo "| pkgs base | \`${BASE}\` |"
+            echo "| linux | \`${LINUX}\` |"
+            echo "| patches | \`$(ls kernel/build/patches/*.patch | wc -l)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: [version, preflight]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - runner: ubuntu-latest
             platform: linux/amd64
             arch: amd64
           - runner: ubuntu-24.04-arm
@@ -58,29 +136,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Lowercase owner
-        id: owner
-        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
-
+      # Per-arch tags: both jobs push to distinct references, then the merge
+      # job joins them. Pushing both to one tag would race.
       - name: Build kernel (${{ matrix.arch }})
         run: |
           make kernel \
             PLATFORM=${{ matrix.platform }} \
             PUSH=true \
             REGISTRY=${{ env.REGISTRY }} \
-            USERNAME=${{ steps.owner.outputs.name }} \
-            TAG=${{ github.sha }}-${{ matrix.arch }}
-
-      - name: Assert PWM driver is enabled
-        if: matrix.arch == 'arm64'
-        run: |
-          grep -q '^CONFIG_PWM_RASPBERRYPI_RP1=y' kernel/build/config-arm64
-          grep -q 'PWM_RASPBERRYPI_RP1' kernel/build/patches/*pwm-rp1*.patch
+            USERNAME=${{ needs.version.outputs.owner }} \
+            TAG=${{ needs.version.outputs.version }}-${{ matrix.arch }}
 
   merge:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -89,25 +163,54 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Lowercase owner
-        id: owner
-        run: echo "name=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
-
+      # Provenance travels with the image rather than being crammed into the
+      # tag, so the imager can cross-check the pkgs base it was built from.
       - name: Create multi-arch manifest
         run: |
-          IMG="${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/kernel"
-          EXTRA=""
-          if [ -n "${{ inputs.extra_tag }}" ]; then
-            EXTRA="-t ${IMG}:${{ inputs.extra_tag }}"
-          fi
+          set -euo pipefail
+          IMG="${{ env.REGISTRY }}/${{ needs.version.outputs.owner }}/kernel"
+          V="${{ needs.version.outputs.version }}"
+
+          git fetch origin "${UPSTREAM_BRANCH}" --tags --quiet || true
+          BASE=$(git describe --tags --abbrev=12 \
+                   "$(git merge-base HEAD "origin/${UPSTREAM_BRANCH}")" 2>/dev/null || echo unknown)
+          LINUX=$(grep '^  linux_version:' Pkgfile | awk '{print $2}')
 
           docker buildx imagetools create \
-            -t "${IMG}:${{ github.sha }}" \
-            ${EXTRA} \
-            "${IMG}:${{ github.sha }}-amd64" \
-            "${IMG}:${{ github.sha }}-arm64"
+            -t "${IMG}:${V}" \
+            --annotation "index:dev.hoefling.pkgs-base=${BASE}" \
+            --annotation "index:dev.hoefling.linux-version=${LINUX}" \
+            --annotation "index:org.opencontainers.image.revision=${{ github.sha }}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            "${IMG}:${V}-amd64" \
+            "${IMG}:${V}-arm64"
 
-      - name: Verify both platforms are present
+      - name: Verify both platforms and the config symbol
         run: |
-          IMG="${{ env.REGISTRY }}/${{ steps.owner.outputs.name }}/kernel"
-          docker buildx imagetools inspect "${IMG}:${{ github.sha }}"
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@latest
+          export PATH="$PATH:$(go env GOPATH)/bin"
+
+          IMG="${{ env.REGISTRY }}/${{ needs.version.outputs.owner }}/kernel:${{ needs.version.outputs.version }}"
+          docker buildx imagetools inspect "$IMG"
+
+          PLATFORMS=$(crane manifest "$IMG" | jq -r '.manifests[].platform.architecture' | sort | tr '\n' ' ')
+          case "$PLATFORMS" in
+            *amd64*arm64*) ;;
+            *) echo "::error::manifest is not multi-arch: ${PLATFORMS}"; exit 1 ;;
+          esac
+
+          # Read the config out of the shipped arm64 kernel. This is the only
+          # check that proves the driver was actually compiled in, rather than
+          # that the inputs looked right.
+          VMLINUZ=$(crane export "${IMG}-arm64" - | tar t | grep -E 'vmlinuz|Image' | head -1)
+          echo "kernel artifact: ${VMLINUZ}"
+          crane export "${IMG}-arm64" - | tar xO "$VMLINUZ" > /tmp/vmlinuz
+
+          curl -sO https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-ikconfig
+          chmod +x extract-ikconfig
+          ./extract-ikconfig /tmp/vmlinuz | grep "^${REQUIRED_SYMBOL}=y" \
+            || { echo "::error::${REQUIRED_SYMBOL} not set in the built kernel"; exit 1; }
+
+          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${IMG}\`" >> "$GITHUB_STEP_SUMMARY"
