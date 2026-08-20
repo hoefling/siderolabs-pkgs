@@ -32,7 +32,9 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  # The upstream branch this fork tracks; used to locate the pkgs base commit.
+  # Upstream repo and branch this fork tracks. `origin` is the fork, so the
+  # upstream remote has to be added explicitly to locate the base commit.
+  UPSTREAM_REPO: https://github.com/siderolabs/pkgs.git
   UPSTREAM_BRANCH: release-1.13
   # Must match the symbol declared by the RP1 PWM patch's Kconfig hunk.
   # Guards against the silent-drop failure: syncconfig discards unknown
@@ -62,6 +64,9 @@ jobs:
   preflight:
     needs: version
     runs-on: ubuntu-latest
+    outputs:
+      pkgs_base: ${{ steps.provenance.outputs.pkgs_base }}
+      linux_version: ${{ steps.provenance.outputs.linux_version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -82,22 +87,37 @@ jobs:
           grep -q "${REQUIRED_SYMBOL}" "$PATCH" \
             || { echo "::error::${REQUIRED_SYMBOL} not declared by ${PATCH}"; exit 1; }
 
-          echo "patch: ${PATCH}"
+          echo "patch:  ${PATCH}"
           echo "symbol: ${REQUIRED_SYMBOL} OK"
+          echo "patches present:"
+          ls -1 kernel/build/patches/*.patch
 
-      - name: Report build inputs
+      - name: Determine provenance
+        id: provenance
         run: |
           set -euo pipefail
-          git fetch origin "${UPSTREAM_BRANCH}" --tags --quiet || true
-          BASE=$(git describe --tags --abbrev=12 \
-                   "$(git merge-base HEAD "origin/${UPSTREAM_BRANCH}")" 2>/dev/null || echo unknown)
+
+          # origin is the fork; upstream must be added to resolve the base.
+          git remote add upstream "${UPSTREAM_REPO}" 2>/dev/null || true
+          git fetch upstream --tags --quiet "${UPSTREAM_BRANCH}"
+
+          MERGE_BASE=$(git merge-base HEAD "upstream/${UPSTREAM_BRANCH}")
+          # --always falls back to a bare SHA when no tag is an ancestor;
+          # upstream pkgs tags sparsely, so that is a real possibility.
+          BASE=$(git describe --tags --always --abbrev=12 "${MERGE_BASE}")
           LINUX=$(grep '^  linux_version:' Pkgfile | awk '{print $2}')
+
+          echo "pkgs_base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "linux_version=${LINUX}" >> "$GITHUB_OUTPUT"
+
           {
             echo "| key | value |"
             echo "|---|---|"
+            echo "| version | \`${{ needs.version.outputs.version }}\` |"
             echo "| pkgs base | \`${BASE}\` |"
+            echo "| merge-base | \`${MERGE_BASE}\` |"
             echo "| linux | \`${LINUX}\` |"
-            echo "| patches | \`$(ls kernel/build/patches/*.patch | wc -l)\` |"
+            echo "| patches | \`$(ls -1 kernel/build/patches/*.patch | wc -l)\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
@@ -148,13 +168,9 @@ jobs:
             TAG=${{ needs.version.outputs.version }}-${{ matrix.arch }}
 
   merge:
-    needs: [version, build]
+    needs: [version, preflight, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -163,27 +179,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Provenance travels with the image rather than being crammed into the
-      # tag, so the imager can cross-check the pkgs base it was built from.
+      # Provenance is computed once in preflight and passed through, so this
+      # job needs no checkout and cannot disagree with the earlier summary.
       - name: Create multi-arch manifest
         run: |
           set -euo pipefail
           IMG="${{ env.REGISTRY }}/${{ needs.version.outputs.owner }}/kernel"
           V="${{ needs.version.outputs.version }}"
 
-          git fetch origin "${UPSTREAM_BRANCH}" --tags --quiet || true
-          BASE=$(git describe --tags --abbrev=12 \
-                   "$(git merge-base HEAD "origin/${UPSTREAM_BRANCH}")" 2>/dev/null || echo unknown)
-          LINUX=$(grep '^  linux_version:' Pkgfile | awk '{print $2}')
-
           docker buildx imagetools create \
             -t "${IMG}:${V}" \
-            --annotation "index:dev.hoefling.pkgs-base=${BASE}" \
-            --annotation "index:dev.hoefling.linux-version=${LINUX}" \
+            --annotation "index:dev.hoefling.pkgs-base=${{ needs.preflight.outputs.pkgs_base }}" \
+            --annotation "index:dev.hoefling.linux-version=${{ needs.preflight.outputs.linux_version }}" \
             --annotation "index:org.opencontainers.image.revision=${{ github.sha }}" \
             --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             "${IMG}:${V}-amd64" \
             "${IMG}:${V}-arm64"
+
+          docker buildx imagetools inspect "${IMG}:${V}"
 
       - name: Verify both platforms and the config symbol
         run: |
@@ -192,9 +205,9 @@ jobs:
           export PATH="$PATH:$(go env GOPATH)/bin"
 
           IMG="${{ env.REGISTRY }}/${{ needs.version.outputs.owner }}/kernel:${{ needs.version.outputs.version }}"
-          docker buildx imagetools inspect "$IMG"
 
           PLATFORMS=$(crane manifest "$IMG" | jq -r '.manifests[].platform.architecture' | sort | tr '\n' ' ')
+          echo "platforms: ${PLATFORMS}"
           case "$PLATFORMS" in
             *amd64*arm64*) ;;
             *) echo "::error::manifest is not multi-arch: ${PLATFORMS}"; exit 1 ;;
@@ -203,14 +216,24 @@ jobs:
           # Read the config out of the shipped arm64 kernel. This is the only
           # check that proves the driver was actually compiled in, rather than
           # that the inputs looked right.
-          VMLINUZ=$(crane export "${IMG}-arm64" - | tar t | grep -E 'vmlinuz|Image' | head -1)
+          ARM="${{ env.REGISTRY }}/${{ needs.version.outputs.owner }}/kernel:${{ needs.version.outputs.version }}-arm64"
+          VMLINUZ=$(crane export "$ARM" - | tar t | grep -E 'vmlinuz|/Image$' | head -1)
+          [ -n "$VMLINUZ" ] || { echo "::error::no kernel artifact found in ${ARM}"; exit 1; }
           echo "kernel artifact: ${VMLINUZ}"
-          crane export "${IMG}-arm64" - | tar xO "$VMLINUZ" > /tmp/vmlinuz
+          crane export "$ARM" - | tar xO "$VMLINUZ" > /tmp/vmlinuz
 
           curl -sO https://raw.githubusercontent.com/torvalds/linux/master/scripts/extract-ikconfig
           chmod +x extract-ikconfig
           ./extract-ikconfig /tmp/vmlinuz | grep "^${REQUIRED_SYMBOL}=y" \
             || { echo "::error::${REQUIRED_SYMBOL} not set in the built kernel"; exit 1; }
 
-          echo "### Published" >> "$GITHUB_STEP_SUMMARY"
-          echo "\`${IMG}\`" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Published"
+            echo ""
+            echo "\`${IMG}\`"
+            echo ""
+            echo "- platforms: \`${PLATFORMS}\`"
+            echo "- pkgs base: \`${{ needs.preflight.outputs.pkgs_base }}\`"
+            echo "- linux: \`${{ needs.preflight.outputs.linux_version }}\`"
+            echo "- \`${REQUIRED_SYMBOL}=y\` confirmed in the built kernel"
+          } >> "$GITHUB_STEP_SUMMARY"
