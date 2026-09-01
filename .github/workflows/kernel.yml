@@ -35,7 +35,7 @@ env:
   # Upstream repo and branch this fork tracks. `origin` is the fork, so the
   # upstream remote has to be added explicitly to locate the base commit.
   UPSTREAM_REPO: https://github.com/siderolabs/pkgs.git
-  UPSTREAM_BRANCH: release-1.13
+  UPSTREAM_BRANCH: release-1.14
   # Must match the symbol declared by the RP1 PWM patch's Kconfig hunk.
   # Guards against the silent-drop failure: syncconfig discards unknown
   # symbols, so a renamed symbol yields a clean build with no driver.
