@@ -1,7 +1,7 @@
-From a150f8611d1b9a803ec8f402b40d25fdf9d85599 Mon Sep 17 00:00:00 2001
+From b578dcfa0bb6e0344e5833638f98b9e2a66721ae Mon Sep 17 00:00:00 2001
 From: Naushir Patuck <naush@raspberrypi.com>
-Date: Mon, 20 Jul 2026 11:44:05 +0200
-Subject: [PATCH] dt-bindings: pwm: Add Raspberry Pi RP1 PWM controller
+Date: Tue, 29 Sep 2026 15:02:11 +0200
+Subject: [PATCH 1/2] dt-bindings: pwm: Add Raspberry Pi RP1 PWM controller
 
 Add the devicetree binding documentation for the PWM
 controller found in the Raspberry Pi RP1 chipset.
@@ -11,7 +11,7 @@ Co-developed-by: Stanimir Varbanov <svarbanov@suse.de>
 Signed-off-by: Stanimir Varbanov <svarbanov@suse.de>
 Signed-off-by: Andrea della Porta <andrea.porta@suse.com>
 Reviewed-by: Krzysztof Kozlowski <krzysztof.kozlowski@oss.qualcomm.com>
-Reviewed-by: Matthias Brugger <mbrugger@suse.com>
+Reviewed-by: Rob Herring (Arm) <robh@kernel.org>
 ---
  .../bindings/pwm/raspberrypi,rp1-pwm.yaml     | 66 +++++++++++++++++++
  1 file changed, 66 insertions(+)
@@ -19,7 +19,7 @@ Reviewed-by: Matthias Brugger <mbrugger@suse.com>
 
 diff --git a/Documentation/devicetree/bindings/pwm/raspberrypi,rp1-pwm.yaml b/Documentation/devicetree/bindings/pwm/raspberrypi,rp1-pwm.yaml
 new file mode 100644
-index 000000000..970d0f3b3
+index 000000000..be020583f
 --- /dev/null
 +++ b/Documentation/devicetree/bindings/pwm/raspberrypi,rp1-pwm.yaml
 @@ -0,0 +1,66 @@
@@ -49,7 +49,7 @@ index 000000000..970d0f3b3
 +   - Optional duty-cycle data FIFO with DMA support
 +   - Optional sigma-delta noise shaping engine
 +  Serves as a fan speed provider to other nodes for a PWM-connected
-+  fan using shared registers (syscon).
++  fan.
 +
 +properties:
 +  compatible:
@@ -90,5 +90,5 @@ index 000000000..970d0f3b3
 +      #pwm-cells = <3>;
 +    };
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 
