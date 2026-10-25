@@ -1,7 +1,7 @@
-From afe6b719b41d42a1bd27473f85f33793a5b890cc Mon Sep 17 00:00:00 2001
+From b8b5b27719a1fa18693404f35cd8c4d80288256c Mon Sep 17 00:00:00 2001
 From: Naushir Patuck <naush@raspberrypi.com>
-Date: Mon, 20 Jul 2026 11:44:06 +0200
-Subject: [PATCH] pwm: rp1: Add RP1 PWM controller driver
+Date: Tue, 29 Sep 2026 15:02:12 +0200
+Subject: [PATCH 2/2] pwm: rp1: Add RP1 PWM controller driver
 
 The Raspberry Pi RP1 southbridge features an embedded PWM
 controller with 4 output channels, alongside an RPM interface
@@ -12,19 +12,21 @@ Add the supporting driver.
 Signed-off-by: Naushir Patuck <naush@raspberrypi.com>
 Co-developed-by: Stanimir Varbanov <svarbanov@suse.de>
 Signed-off-by: Stanimir Varbanov <svarbanov@suse.de>
+Co-developed-by: Andrea della Porta <andrea.porta@suse.com>
 Signed-off-by: Andrea della Porta <andrea.porta@suse.com>
+Tested-by: Gary Guo <gary@garyguo.net>
 ---
- drivers/pwm/Kconfig   |   9 +
+ drivers/pwm/Kconfig   |   7 +
  drivers/pwm/Makefile  |   1 +
  drivers/pwm/pwm-rp1.c | 428 ++++++++++++++++++++++++++++++++++++++++++
- 3 files changed, 438 insertions(+)
+ 3 files changed, 436 insertions(+)
  create mode 100644 drivers/pwm/pwm-rp1.c
 
 diff --git a/drivers/pwm/Kconfig b/drivers/pwm/Kconfig
-index c2fd3f4b6..ade60a867 100644
+index c2fd3f4b6..19c278e8c 100644
 --- a/drivers/pwm/Kconfig
 +++ b/drivers/pwm/Kconfig
-@@ -615,6 +615,15 @@ config PWM_ROCKCHIP
+@@ -615,6 +615,13 @@ config PWM_ROCKCHIP
  	  Generic PWM framework driver for the PWM controller found on
  	  Rockchip SoCs.
  
@@ -32,8 +34,6 @@ index c2fd3f4b6..ade60a867 100644
 +	tristate "RP1 PWM support"
 +	depends on MISC_RP1 || COMPILE_TEST
 +	depends on HAS_IOMEM
-+	select REGMAP_MMIO
-+	select MFD_SYSCON
 +	help
 +	  PWM framework driver for Raspberry Pi RP1 controller.
 +
@@ -54,7 +54,7 @@ index dfa8b4966..46ec7ce2a 100644
  obj-$(CONFIG_PWM_SL28CPLD)	+= pwm-sl28cpld.o
 diff --git a/drivers/pwm/pwm-rp1.c b/drivers/pwm/pwm-rp1.c
 new file mode 100644
-index 000000000..e2d7af80d
+index 000000000..d4b13fba8
 --- /dev/null
 +++ b/drivers/pwm/pwm-rp1.c
 @@ -0,0 +1,428 @@
@@ -98,7 +98,8 @@ index 000000000..e2d7af80d
 + *   channel. As a result, phase control will be ignored for now.
 + */
 +
-+#include <linux/bitops.h>
++#include <linux/bitfield.h>
++#include <linux/bits.h>
 +#include <linux/clk.h>
 +#include <linux/err.h>
 +#include <linux/io.h>
@@ -106,9 +107,8 @@ index 000000000..e2d7af80d
 +#include <linux/of.h>
 +#include <linux/platform_device.h>
 +#include <linux/pwm.h>
-+#include <linux/regmap.h>
-+#include <linux/mfd/syscon.h>
 +#include <linux/units.h>
++#include <linux/spinlock.h>
 +
 +#define RP1_PWM_GLB_CTRL			0x000
 +#define RP1_PWM_GLB_CTRL_CHANNEL_ENABLE(chan)	BIT(chan)
@@ -140,10 +140,11 @@ index 000000000..e2d7af80d
 +#define RP1_PWM_NUM_PWMS			4
 +
 +struct rp1_pwm {
-+	struct regmap *regmap;
++	void __iomem *base;
 +	struct clk *clk;
 +	unsigned long clk_rate;
 +	bool clk_enabled;
++	spinlock_t lock; /* sync for RP1_PWM_GLB_CTRL RMW access */
 +};
 +
 +struct rp1_pwm_waveform {
@@ -153,31 +154,28 @@ index 000000000..e2d7af80d
 +	bool inverted_polarity;
 +};
 +
-+static const struct regmap_config rp1_pwm_regmap_config = {
-+	.reg_bits = 32,
-+	.val_bits = 32,
-+	.reg_stride = 4,
-+	.max_register = 0x60,
-+};
-+
 +static void rp1_pwm_apply_config(struct pwm_chip *chip, struct pwm_device *pwm)
 +{
 +	struct rp1_pwm *rp1 = pwmchip_get_drvdata(chip);
 +	u32 value;
 +
 +	/* update the changed registers on the next strobe to avoid glitches */
-+	regmap_read(rp1->regmap, RP1_PWM_GLB_CTRL, &value);
++	value = readl(rp1->base + RP1_PWM_GLB_CTRL);
 +	value |= RP1_PWM_GLB_CTRL_SET_UPDATE;
-+	regmap_write(rp1->regmap, RP1_PWM_GLB_CTRL, value);
++	writel(value, rp1->base + RP1_PWM_GLB_CTRL);
 +}
 +
 +static int rp1_pwm_request(struct pwm_chip *chip, struct pwm_device *pwm)
 +{
 +	struct rp1_pwm *rp1 = pwmchip_get_drvdata(chip);
++	u32 value, polarity;
 +
 +	/* init channel to reset defaults, preserving the polarity bit */
-+	regmap_update_bits(rp1->regmap, RP1_PWM_CHAN_CTRL(pwm->hwpwm),
-+			   ~(u32)RP1_PWM_CHAN_CTRL_POLARITY, RP1_PWM_CHAN_CTRL_DEFAULT);
++	value = readl(rp1->base + RP1_PWM_CHAN_CTRL(pwm->hwpwm));
++	polarity = FIELD_GET(RP1_PWM_CHAN_CTRL_POLARITY, value);
++	value = u32_replace_bits(RP1_PWM_CHAN_CTRL_DEFAULT, polarity, RP1_PWM_CHAN_CTRL_POLARITY);
++	writel(value, rp1->base + RP1_PWM_CHAN_CTRL(pwm->hwpwm));
++
 +	return 0;
 +}
 +
@@ -250,10 +248,11 @@ index 000000000..e2d7af80d
 +		return 0;
 +
 +	wf->period_length_ns = DIV_ROUND_UP_ULL(((u64)wfhw->period_ticks + 1) * NSEC_PER_SEC,
-+						clk_rate);
++						(u32)clk_rate);
 +
 +	if (!wfhw->inverted_polarity) {
-+		wf->duty_length_ns = DIV_ROUND_UP_ULL((u64)wfhw->duty_ticks * NSEC_PER_SEC,
++		ticks = min_t(u64, wfhw->duty_ticks, (u64)wfhw->period_ticks + 1);
++		wf->duty_length_ns = DIV_ROUND_UP_ULL(ticks * NSEC_PER_SEC,
 +						      (u32)clk_rate);
 +	} else {
 +		if (wfhw->duty_ticks > (u64)wfhw->period_ticks + 1) {
@@ -262,9 +261,9 @@ index 000000000..e2d7af80d
 +		} else {
 +			ticks = (u64)wfhw->period_ticks + 1 - wfhw->duty_ticks;
 +		}
-+		wf->duty_length_ns = DIV_ROUND_UP_ULL(ticks * NSEC_PER_SEC, clk_rate);
++		wf->duty_length_ns = DIV_ROUND_UP_ULL(ticks * NSEC_PER_SEC, (u32)clk_rate);
 +		wf->duty_offset_ns = DIV_ROUND_UP_ULL((u64)(wfhw->period_ticks + 1 - ticks) *
-+						      NSEC_PER_SEC, clk_rate);
++						      NSEC_PER_SEC, (u32)clk_rate);
 +	}
 +
 +	return 0;
@@ -279,32 +278,32 @@ index 000000000..e2d7af80d
 +	u32 value, ctrl;
 +
 +	/* set polarity */
-+	regmap_read(rp1->regmap, RP1_PWM_CHAN_CTRL(pwm->hwpwm), &value);
++	value = readl(rp1->base + RP1_PWM_CHAN_CTRL(pwm->hwpwm));
 +	if (!wfhw->inverted_polarity)
 +		value &= ~RP1_PWM_CHAN_CTRL_POLARITY;
 +	else
 +		value |= RP1_PWM_CHAN_CTRL_POLARITY;
-+	regmap_write(rp1->regmap, RP1_PWM_CHAN_CTRL(pwm->hwpwm), value);
++	writel(value, rp1->base + RP1_PWM_CHAN_CTRL(pwm->hwpwm));
++
++	guard(spinlock_irqsave)(&rp1->lock);
 +
 +	/* early exit if disabled */
-+	regmap_read(rp1->regmap, RP1_PWM_GLB_CTRL, &ctrl);
++	ctrl = readl(rp1->base + RP1_PWM_GLB_CTRL);
 +	if (!wfhw->enabled) {
 +		ctrl &= ~RP1_PWM_GLB_CTRL_CHANNEL_ENABLE(pwm->hwpwm);
 +		/* just disable the channel and bail out early */
-+		regmap_write(rp1->regmap, RP1_PWM_GLB_CTRL, ctrl);
++		writel(ctrl, rp1->base + RP1_PWM_GLB_CTRL);
 +		rp1_pwm_apply_config(chip, pwm);
 +		return 0;
 +	}
 +
 +	/* set period and duty cycle */
-+	regmap_write(rp1->regmap,
-+		     RP1_PWM_RANGE(pwm->hwpwm), wfhw->period_ticks);
-+	regmap_write(rp1->regmap,
-+		     RP1_PWM_DUTY(pwm->hwpwm), wfhw->duty_ticks);
++	writel(wfhw->period_ticks, rp1->base + RP1_PWM_RANGE(pwm->hwpwm));
++	writel(wfhw->duty_ticks, rp1->base + RP1_PWM_DUTY(pwm->hwpwm));
 +
 +	/* enable the channel */
 +	ctrl |= RP1_PWM_GLB_CTRL_CHANNEL_ENABLE(pwm->hwpwm);
-+	regmap_write(rp1->regmap, RP1_PWM_GLB_CTRL, ctrl);
++	writel(ctrl,  rp1->base + RP1_PWM_GLB_CTRL);
 +
 +	rp1_pwm_apply_config(chip, pwm);
 +
@@ -319,20 +318,20 @@ index 000000000..e2d7af80d
 +	struct rp1_pwm_waveform *wfhw = _wfhw;
 +	u32 value;
 +
-+	regmap_read(rp1->regmap, RP1_PWM_GLB_CTRL, &value);
++	*wfhw = (typeof(*wfhw)) {
++		.period_ticks = 0,
++		.duty_ticks = 0,
++	};
++
++	value = readl(rp1->base + RP1_PWM_GLB_CTRL);
 +	wfhw->enabled = !!(value & RP1_PWM_GLB_CTRL_CHANNEL_ENABLE(pwm->hwpwm));
 +
-+	regmap_read(rp1->regmap, RP1_PWM_CHAN_CTRL(pwm->hwpwm), &value);
++	value = readl(rp1->base + RP1_PWM_CHAN_CTRL(pwm->hwpwm));
 +	wfhw->inverted_polarity = !!(value & RP1_PWM_CHAN_CTRL_POLARITY);
 +
 +	if (wfhw->enabled) {
-+		regmap_read(rp1->regmap, RP1_PWM_RANGE(pwm->hwpwm), &wfhw->period_ticks);
-+		regmap_read(rp1->regmap, RP1_PWM_DUTY(pwm->hwpwm), &wfhw->duty_ticks);
-+	} else {
-+		*wfhw = (typeof(*wfhw)) {
-+			.period_ticks = 0,
-+			.duty_ticks = 0,
-+		};
++		wfhw->period_ticks = readl(rp1->base + RP1_PWM_RANGE(pwm->hwpwm));
++		wfhw->duty_ticks = readl(rp1->base + RP1_PWM_DUTY(pwm->hwpwm));
 +	}
 +
 +	return 0;
@@ -350,10 +349,8 @@ index 000000000..e2d7af80d
 +static int rp1_pwm_probe(struct platform_device *pdev)
 +{
 +	struct device *dev = &pdev->dev;
-+	struct device_node *np = dev->of_node;
 +	unsigned long clk_rate;
 +	struct pwm_chip *chip;
-+	void __iomem	*base;
 +	struct rp1_pwm *rp1;
 +	int ret;
 +
@@ -362,14 +359,11 @@ index 000000000..e2d7af80d
 +		return PTR_ERR(chip);
 +
 +	rp1 = pwmchip_get_drvdata(chip);
++	spin_lock_init(&rp1->lock);
 +
-+	base = devm_platform_ioremap_resource(pdev, 0);
-+	if (IS_ERR(base))
-+		return PTR_ERR(base);
-+
-+	rp1->regmap = devm_regmap_init_mmio(dev, base, &rp1_pwm_regmap_config);
-+	if (IS_ERR(rp1->regmap))
-+		return dev_err_probe(dev, PTR_ERR(rp1->regmap), "Cannot initialize regmap\n");
++	rp1->base = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(rp1->base))
++		return PTR_ERR(rp1->base);
 +
 +	rp1->clk = devm_clk_get(dev, NULL);
 +	if (IS_ERR(rp1->clk))
@@ -413,22 +407,33 @@ index 000000000..e2d7af80d
 +		goto err_disable_clk;
 +	}
 +
-+	ret = of_syscon_register_regmap(np, rp1->regmap);
-+	if (ret) {
-+		dev_err_probe(dev, ret, "Failed to register syscon\n");
-+		goto err_remove_chip;
-+	}
-+
 +	return 0;
 +
-+err_remove_chip:
-+	pwmchip_remove(chip);
 +err_disable_clk:
 +	clk_disable_unprepare(rp1->clk);
 +
 +	return ret;
 +}
 +
++static void rp1_pwm_remove(struct platform_device *pdev)
++{
++	struct pwm_chip *chip = platform_get_drvdata(pdev);
++	struct rp1_pwm *rp1 = pwmchip_get_drvdata(chip);
++
++	pwmchip_remove(chip);
++
++	if (rp1->clk_enabled) {
++		clk_disable_unprepare(rp1->clk);
++		rp1->clk_enabled = false;
++	}
++}
++
++/*
++ * The PWM core is never powered off, so it retains its
++ * register configuration across suspend/resume. This
++ * means there's no need to save and restore the
++ * channel control register.
++ */
 +static int rp1_pwm_suspend(struct device *dev)
 +{
 +	struct pwm_chip *chip = dev_get_drvdata(dev);
@@ -453,7 +458,6 @@ index 000000000..e2d7af80d
 +		dev_err(dev, "Failed to enable clock on resume: %pe\n", ERR_PTR(ret));
 +		return ret;
 +	}
-+
 +	rp1->clk_enabled = true;
 +
 +	return 0;
@@ -469,23 +473,19 @@ index 000000000..e2d7af80d
 +
 +static struct platform_driver rp1_pwm_driver = {
 +	.probe = rp1_pwm_probe,
-+	/*
-+	 * .remove is not needed because this driver cannot be removed/unbound
-+	 * cause it relies on syscon which cannot be removed
-+	 */
++	.remove = rp1_pwm_remove,
 +	.driver = {
 +		.name = "rp1-pwm",
 +		.of_match_table = rp1_pwm_of_match,
 +		.pm = pm_ptr(&rp1_pwm_pm_ops),
-+		.suppress_bind_attrs = true,
 +	},
 +};
-+builtin_platform_driver(rp1_pwm_driver);
++module_platform_driver(rp1_pwm_driver);
 +
 +MODULE_DESCRIPTION("RP1 PWM driver");
 +MODULE_AUTHOR("Naushir Patuck <naush@raspberrypi.com>");
 +MODULE_AUTHOR("Andrea della Porta <andrea.porta@suse.com>");
 +MODULE_LICENSE("GPL");
 -- 
-2.50.1 (Apple Git-155)
+2.54.0 (Apple Git-157)
 
